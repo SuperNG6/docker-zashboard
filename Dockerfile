@@ -22,28 +22,12 @@ RUN set -eux; \
     fi; \
     test -f /web/index.html
 
-FROM caddy:2-builder AS caddy-builder
+FROM caddy:2-alpine
 
-RUN CGO_ENABLED=0 xcaddy build --output /out/caddy
-
-FROM alpine:3.23 AS runtime-dirs
-
-RUN mkdir -p /out/tmp && chmod 1777 /out/tmp
-
-FROM scratch
-
-COPY --from=caddy-builder /out/caddy /usr/bin/caddy
 COPY --from=fetcher /web/ /srv/
-COPY --from=runtime-dirs /out/tmp /tmp
 COPY Caddyfile /etc/caddy/Caddyfile
 
-ENV HOME=/tmp
-ENV XDG_CONFIG_HOME=/tmp
-ENV XDG_DATA_HOME=/tmp
 ENV PORT=8080
 
-USER 65532:65532
+USER caddy
 EXPOSE 8080
-
-ENTRYPOINT ["/usr/bin/caddy"]
-CMD ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

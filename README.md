@@ -11,6 +11,7 @@
 - 主标签（无变体后缀）固定对应 `dist.zip`
 - 多平台镜像：`linux/amd64`、`linux/arm64`、`linux/arm/v7`
 - 镜像仓库名：`superng6/zashboard`（Docker Hub）与 `ghcr.io/superng6/zashboard`（GHCR）
+- 已同步过的同版本 release 会自动跳过，不重复更新
 - 避免重复构建：如果目标 tag 已存在则自动跳过
 - 支持 `workflow_dispatch` 手动指定 tag / asset / 强制重建
 
@@ -41,7 +42,7 @@
 
 - 使用多阶段构建：
   - 构建阶段下载并解压上游发布产物
-  - 运行阶段使用 `scratch` + `caddy` 二进制 + 静态文件
-- 运行容器使用非 root 用户（`65532:65532`）
+  - 运行阶段使用官方 `caddy:2-alpine` + 静态文件
+- 运行容器使用 `caddy` 用户
 - SPA 路由回退到 `index.html`
 - `.dockerignore` 最小化构建上下文
