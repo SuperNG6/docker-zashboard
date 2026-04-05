@@ -24,10 +24,13 @@ RUN set -eux; \
 
 FROM caddy:2-alpine
 
+RUN addgroup -S caddy 2>/dev/null || true \
+ && adduser -S -D -H -G caddy -s /sbin/nologin caddy 2>/dev/null || true
+
 COPY --from=fetcher /web/ /srv/
-COPY Caddyfile /etc/caddy/Caddyfile
+COPY --chown=caddy:caddy Caddyfile /etc/caddy/Caddyfile
 
 ENV PORT=8080
 
-USER caddy
 EXPOSE 8080
+USER caddy

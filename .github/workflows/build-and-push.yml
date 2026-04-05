@@ -334,6 +334,8 @@ jobs:
             org.opencontainers.image.created=${{ needs.prepare.outputs.published_at }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.ref.name=${{ matrix.asset_name }}
+          provenance: false
+          sbom: false
           cache-from: type=gha,scope=docker-zashboard-${{ matrix.asset_name }}
           cache-to: type=gha,mode=max,scope=docker-zashboard-${{ matrix.asset_name }}
 
