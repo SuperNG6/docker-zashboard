@@ -1,0 +1,299 @@
+name: Build and Push Container Images
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "指定上游 release tag，留空则使用 latest"
+        required: false
+        type: string
+      asset_name:
+        description: "发布资产名，留空构建所有 dist*.zip"
+        required: false
+        type: string
+      force_build:
+        description: "即使目标 tag 已存在也强制构建"
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types:
+      - upstream_release
+
+env:
+  UPSTREAM_REPO: Zephyruso/zashboard
+  # Docker Hub 镜像名称
+  DOCKER_IMAGE: superng6/zashboard
+  # GitHub Container Registry (ghcr.io) 镜像名称
+  GHCR_IMAGE: ghcr.io/superng6/zashboard
+  PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
+
+concurrency:
+  group: docker-zashboard-release-build
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      is_prerelease: ${{ steps.resolve.outputs.is_prerelease }}
+      published_at: ${{ steps.resolve.outputs.published_at }}
+      asset_matrix: ${{ steps.resolve.outputs.asset_matrix }}
+
+    steps:
+      - name: Resolve upstream release and asset matrix
+        id: resolve
+        env:
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.client_payload.release_tag || '' }}
+          INPUT_ASSET_NAME: ${{ github.event.inputs.asset_name || github.event.client_payload.asset_name || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_RELEASE_TAG}" ]]; then
+            api_url="https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${INPUT_RELEASE_TAG}"
+          else
+            api_url="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
+          fi
+
+          release_json="$(curl -fsSL -H "Accept: application/vnd.github+json" "${api_url}")"
+          tag="$(jq -r '.tag_name // empty' <<<"${release_json}")"
+          prerelease="$(jq -r '.prerelease // false' <<<"${release_json}")"
+          published_at="$(jq -r '.published_at // .created_at // empty' <<<"${release_json}")"
+
+          if [[ -z "${tag}" ]]; then
+            echo "无法解析上游 release tag" >&2
+            exit 1
+          fi
+
+          if [[ -n "${INPUT_ASSET_NAME}" ]]; then
+            matrix_json="$(jq -cr --arg n "${INPUT_ASSET_NAME}" '[.assets[] | select(.name == $n) | {asset_name: .name, asset_url: .browser_download_url}]' <<<"${release_json}")"
+          else
+            matrix_json="$(jq -cr '[.assets[] | select(.name | test("^dist(-[A-Za-z0-9.-]+)?\\.zip$")) | {asset_name: .name, asset_url: .browser_download_url}]' <<<"${release_json}")"
+          fi
+
+          if [[ "$(jq -r 'length' <<<"${matrix_json}")" -eq 0 ]]; then
+            echo "未找到可构建资产，输入 asset_name=${INPUT_ASSET_NAME:-<all dist*.zip>}" >&2
+            exit 1
+          fi
+
+          echo "release_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "release_version=${tag#v}" >> "${GITHUB_OUTPUT}"
+          echo "is_prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "published_at=${published_at}" >> "${GITHUB_OUTPUT}"
+          echo "asset_matrix=${matrix_json}" >> "${GITHUB_OUTPUT}"
+
+      - name: Sync repository release tag and release
+        uses: actions/github-script@v7
+        env:
+          UPSTREAM_RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          UPSTREAM_IS_PRERELEASE: ${{ steps.resolve.outputs.is_prerelease }}
+          UPSTREAM_REPO_NAME: ${{ env.UPSTREAM_REPO }}
+        with:
+          script: |
+            const tag = process.env.UPSTREAM_RELEASE_TAG;
+            const isPrerelease = (process.env.UPSTREAM_IS_PRERELEASE || 'false') === 'true';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha = context.sha;
+
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              core.info(`Tag ${tag} already exists.`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
+              core.info(`Created tag ${tag} at ${sha}.`);
+            }
+
+            try {
+              await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.info(`Release ${tag} already exists.`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              const body = `Synced from upstream release: https://github.com/${process.env.UPSTREAM_REPO_NAME}/releases/tag/${tag}`;
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                target_commitish: sha,
+                name: `zashboard ${tag}`,
+                body,
+                prerelease: isPrerelease,
+                draft: false
+              });
+              core.info(`Created release ${tag}.`);
+            }
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.asset_matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect Docker Hub credentials
+        id: dockerhub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Login to Docker Hub
+        if: steps.dockerhub.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive tags by asset
+        id: tags
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+          IS_PRERELEASE: ${{ needs.prepare.outputs.is_prerelease }}
+          ASSET_NAME: ${{ matrix.asset_name }}
+          ENABLE_DOCKERHUB: ${{ steps.dockerhub.outputs.enabled }}
+        run: |
+          set -euo pipefail
+
+          suffix=""
+          if [[ "${ASSET_NAME}" != "dist.zip" ]]; then
+            suffix="-${ASSET_NAME#dist-}"
+            suffix="${suffix%.zip}"
+          fi
+
+          major="$(cut -d. -f1 <<<"${RELEASE_VERSION}")"
+          minor="$(cut -d. -f2 <<<"${RELEASE_VERSION}")"
+          major_minor="${major}.${minor}"
+
+          image_tags=()
+          add_tags_for_image() {
+            local image="$1"
+            image_tags+=("${image}:${RELEASE_TAG}${suffix}")
+            image_tags+=("${image}:${RELEASE_VERSION}${suffix}")
+            image_tags+=("${image}:${major_minor}${suffix}")
+            image_tags+=("${image}:${major}${suffix}")
+            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+              image_tags+=("${image}:latest${suffix}")
+            fi
+            image_tags+=("${image}:sha-${GITHUB_SHA::7}${suffix}")
+          }
+
+          add_tags_for_image "${GHCR_IMAGE}"
+          if [[ "${ENABLE_DOCKERHUB}" == "true" ]]; then
+            add_tags_for_image "${DOCKER_IMAGE}"
+          fi
+
+          {
+            echo "variant_suffix=${suffix}"
+            echo "primary_tag=${RELEASE_TAG}${suffix}"
+            echo "tags<<EOF"
+            printf '%s\n' "${image_tags[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check if image tag already exists
+        id: exists
+        env:
+          TARGET_TAG: ${{ steps.tags.outputs.primary_tag }}
+        run: |
+          set -euo pipefail
+
+          if docker manifest inspect "${GHCR_IMAGE}:${TARGET_TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Decide whether to build
+        id: decision
+        env:
+          FORCE_BUILD: ${{ github.event.inputs.force_build || github.event.client_payload.force_build || 'false' }}
+          EXISTS: ${{ steps.exists.outputs.exists }}
+        run: |
+          set -euo pipefail
+
+          force_build="$(echo "${FORCE_BUILD}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${force_build}" == "true" || "${EXISTS}" != "true" ]]; then
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Skip build (already exists)
+        if: steps.decision.outputs.should_build != 'true'
+        run: |
+          echo "Image ${GHCR_IMAGE}:${{ steps.tags.outputs.primary_tag }} already exists. Skip build."
+
+      - name: Set up QEMU
+        if: steps.decision.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: steps.decision.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.decision.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          pull: true
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            UPSTREAM_TAG=${{ needs.prepare.outputs.release_tag }}
+            DIST_ASSET=${{ matrix.asset_name }}
+            DIST_URL=${{ matrix.asset_url }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=docker-zashboard
+            org.opencontainers.image.description=Container image for zashboard static frontend
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.release_tag }}${{ steps.tags.outputs.variant_suffix }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.published_at }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=${{ matrix.asset_name }}
+          cache-from: type=gha,scope=docker-zashboard-${{ matrix.asset_name }}
+          cache-to: type=gha,mode=max,scope=docker-zashboard-${{ matrix.asset_name }}
+
+      - name: Show published tags
+        if: steps.decision.outputs.should_build == 'true'
+        run: |
+          echo "Release: ${{ needs.prepare.outputs.release_tag }}"
+          echo "Asset: ${{ matrix.asset_name }}"
+          echo "Variant suffix: ${{ steps.tags.outputs.variant_suffix }}"
+          echo "Image tags:"
+          echo "${{ steps.tags.outputs.tags }}"

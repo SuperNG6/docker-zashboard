@@ -1,0 +1,16 @@
+{
+    auto_https off
+    admin off
+    persist_config off
+}
+
+:{$PORT} {
+    encode gzip zstd
+
+    root * /srv
+
+    # SPA fallback
+    try_files {path} /index.html
+
+    file_server
+}
