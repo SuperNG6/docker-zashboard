@@ -29,5 +29,5 @@ COPY Caddyfile /etc/caddy/Caddyfile
 
 ENV PORT=8080
 
-USER caddy
 EXPOSE 8080
+USER caddy
