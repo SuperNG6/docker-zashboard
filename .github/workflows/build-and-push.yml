@@ -54,6 +54,7 @@ jobs:
         env:
           INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.client_payload.release_tag || '' }}
           INPUT_ASSET_NAME: ${{ github.event.inputs.asset_name || github.event.client_payload.asset_name || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -63,7 +64,7 @@ jobs:
             api_url="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
           fi
 
-          release_json="$(curl -fsSL -H "Accept: application/vnd.github+json" "${api_url}")"
+          release_json="$(curl -fsSL -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "${api_url}")"
           tag="$(jq -r '.tag_name // empty' <<<"${release_json}")"
           prerelease="$(jq -r '.prerelease // false' <<<"${release_json}")"
           published_at="$(jq -r '.published_at // .created_at // empty' <<<"${release_json}")"
@@ -198,7 +199,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.CR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Detect Docker Hub credentials
         id: dockerhub
