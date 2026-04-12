@@ -2,7 +2,7 @@ name: Build and Push Container Images
 
 on:
   schedule:
-    - cron: "0 3 * * 1"
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -24,9 +24,7 @@ on:
 
 env:
   UPSTREAM_REPO: Zephyruso/zashboard
-  # Docker Hub 镜像名称
   DOCKER_IMAGE: superng6/zashboard
-  # GitHub Container Registry (ghcr.io) 镜像名称
   GHCR_IMAGE: ghcr.io/superng6/zashboard
   PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
 
@@ -175,8 +173,7 @@ jobs:
 
       - name: Skip sync for same version
         if: steps.decide.outputs.should_run != 'true'
-        run: |
-          echo "Skip sync because release version is unchanged."
+        run: echo "Skip sync because release version is unchanged."
 
   build-and-push:
     if: needs.prepare.outputs.should_run == 'true'
@@ -270,54 +267,24 @@ jobs:
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Check if image tag already exists
-        id: exists
-        env:
-          TARGET_TAG: ${{ steps.tags.outputs.primary_tag }}
-        run: |
-          set -euo pipefail
-
-          if docker manifest inspect "${GHCR_IMAGE}:${TARGET_TAG}" >/dev/null 2>&1; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Decide whether to build
-        id: decision
-        env:
-          FORCE_BUILD: ${{ github.event.inputs.force_build || github.event.client_payload.force_build || 'false' }}
-          EXISTS: ${{ steps.exists.outputs.exists }}
-        run: |
-          set -euo pipefail
-
-          force_build="$(echo "${FORCE_BUILD}" | tr '[:upper:]' '[:lower:]')"
-          if [[ "${force_build}" == "true" || "${EXISTS}" != "true" ]]; then
-            echo "should_build=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "should_build=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Skip build (already exists)
-        if: steps.decision.outputs.should_build != 'true'
-        run: |
-          echo "Image ${GHCR_IMAGE}:${{ steps.tags.outputs.primary_tag }} already exists. Skip build."
-
       - name: Set up QEMU
-        if: steps.decision.outputs.should_build == 'true'
         uses: docker/setup-qemu-action@v4.0.0
 
       - name: Set up Buildx
-        if: steps.decision.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v4.0.0
 
+      - name: Sanitize cache key
+        id: cache
+        run: |
+          slug="${{ matrix.asset_name }}"
+          slug="${slug//\./-}"
+          echo "key=buildcache-${slug}" >> "${GITHUB_OUTPUT}"
+
       - name: Build and push image
-        if: steps.decision.outputs.should_build == 'true'
         uses: docker/build-push-action@v7.0.0
         with:
           context: .
           file: ./Dockerfile
-          pull: true
           push: true
           platforms: ${{ env.PLATFORMS }}
           build-args: |
@@ -336,11 +303,10 @@ jobs:
             org.opencontainers.image.ref.name=${{ matrix.asset_name }}
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=docker-zashboard-${{ matrix.asset_name }}
-          cache-to: type=gha,mode=max,scope=docker-zashboard-${{ matrix.asset_name }}
+          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:${{ steps.cache.outputs.key }}
+          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:${{ steps.cache.outputs.key }},mode=max
 
       - name: Show published tags
-        if: steps.decision.outputs.should_build == 'true'
         run: |
           echo "Release: ${{ needs.prepare.outputs.release_tag }}"
           echo "Asset: ${{ matrix.asset_name }}"
